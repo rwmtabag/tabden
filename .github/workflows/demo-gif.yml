@@ -1,0 +1,122 @@
+name: demo-gif
+
+# Builds docs/img/demo.gif from docs/demo/demo.cast (recorded with
+# tools/record-demo.sh) and commits it back to the branch that was pushed.
+# See "Refreshing the demo and screenshots" in docs/design.md.
+
+on:
+  push:
+    paths:
+      - 'docs/demo/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the run before it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # agg publishes bare binaries and no checksum file, so the checksum here was
+  # taken from the v1.9.0 release asset itself. To move to a newer agg, change
+  # all three together.
+  AGG_VERSION: v1.9.0
+  AGG_ASSET: agg-x86_64-unknown-linux-musl
+  AGG_SHA256: ddcbf6ca044c8ac3a434dcb9ee89fb9e3be87209982b7c2adb55f782e8f0f390
+  CAST: docs/demo/demo.cast
+  GIF: docs/img/demo.gif
+
+jobs:
+  gif:
+    # Never in a fork, and only for a branch (not a tag).
+    if: ${{ !github.event.repository.fork && github.ref_type == 'branch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to commit the GIF back; nothing else
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install agg, a font and gifsicle
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fonts-jetbrains-mono fonts-dejavu-core gifsicle
+          curl -fsSL -o "$RUNNER_TEMP/agg" \
+            "https://github.com/asciinema/agg/releases/download/${AGG_VERSION}/${AGG_ASSET}"
+          echo "${AGG_SHA256}  ${RUNNER_TEMP}/agg" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/agg"
+          "$RUNNER_TEMP/agg" --version
+
+      - name: Pick the colours
+        run: |
+          [ -f "$CAST" ] || { echo "::error::$CAST not found"; exit 1; }
+          theme=""
+          if [ -f docs/demo/demo.theme ]; then theme=$(head -n 1 docs/demo/demo.theme | tr -d '[:space:]'); fi
+          case ${theme:-default} in
+            default)
+              # tabden set no colours when this was recorded; use agg's own dark theme.
+              palette=asciinema ;;
+            catppuccin-mocha|tokyonight|gruvbox-dark)
+              # One source for the colours: theme_palette in launcher.sh, which
+              # prints background, foreground, cursor and color0..15. agg takes
+              # background, foreground and the 16 colours as bare hex values.
+              fn=$(awk '/^theme_palette\(\) \{/,/^}/' launcher.sh)
+              [ -n "$fn" ] || { echo "::error::theme_palette not found in launcher.sh"; exit 1; }
+              eval "$fn"
+              palette=$(theme_palette "$theme" |
+                awk -F'=#' '$1 != "cursor" { printf "%s%s", (n++ ? "," : ""), $2 }')
+              count=$(tr ',' '\n' <<<"$palette" | grep -cE '^[0-9a-f]{6}$')
+              [ "$count" = 18 ] || { echo "::error::expected 18 colours for $theme, got $count"; exit 1; }
+              ;;
+            *)
+              echo "::error::unknown theme in docs/demo/demo.theme"; exit 1 ;;
+          esac
+          echo "theme: ${theme:-default}"
+          echo "AGG_THEME=$palette" >> "$GITHUB_ENV"
+
+      - name: Render the GIF
+        run: |
+          mkdir -p "$(dirname "$GIF")"
+          # Pauses longer than 2 s are cut to 2 s; the last frame stays for 2 s.
+          # 100 columns at 16 px comes out about 980 px wide.
+          "$RUNNER_TEMP/agg" --quiet --idle-time-limit 2 --last-frame-duration 2 \
+            --text-font-family "JetBrains Mono,DejaVu Sans Mono" --font-size 16 \
+            --theme "$AGG_THEME" "$CAST" "$GIF"
+
+      - name: Shrink it if it is over 3 MB
+        run: |
+          size=$(stat -c %s "$GIF")
+          if [ "$size" -gt $((3 * 1024 * 1024)) ]; then
+            echo "GIF is $size bytes; optimising with gifsicle"
+            gifsicle -O3 --lossy=80 -o "$GIF.tmp" "$GIF" && mv -f "$GIF.tmp" "$GIF"
+          fi
+
+      - name: Report size and dimensions
+        run: |
+          size=$(stat -c %s "$GIF")
+          dims=$(gifsicle --info "$GIF" | sed -n 's/^ *logical screen \([0-9]*x[0-9]*\).*/\1/p' | head -n 1)
+          frames=$(gifsicle --info "$GIF" | sed -n '1s/.* \([0-9]*\) images.*/\1/p')
+          mb=$(awk -v s="$size" 'BEGIN { printf "%.2f", s / 1048576 }')
+          line="$GIF: ${dims} px, ${mb} MB (${size} bytes), ${frames} frames"
+          echo "$line"
+          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          width=${dims%x*}
+          if [ "${width:-0}" -lt 900 ] || [ "${width:-0}" -gt 1000 ]; then
+            echo "::warning::GIF is ${width} px wide; the target is 900 to 1000."
+          fi
+
+      - name: Commit the GIF to the branch that was pushed
+        run: |
+          if [ -z "$(git status --porcelain -- "$GIF")" ]; then
+            echo "The GIF didn't change; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$GIF"
+          git commit -m "Regenerate docs/img/demo.gif (generated by the demo-gif workflow)" \
+            -m "Built from docs/demo/demo.cast at ${GITHUB_SHA} with agg ${AGG_VERSION}. Don't edit it by hand: record again with tools/record-demo.sh."
+          # The same branch only, and never forced: if the branch has moved on,
+          # this fails and the run for the newer push takes over.
+          git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
